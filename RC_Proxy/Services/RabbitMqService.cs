@@ -1,47 +1,52 @@
-﻿// RC_Proxy/Services/RabbitMqService.cs
-
-using System.Net.Sockets;
+﻿using System;
+using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Logging;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
-using RC_Proxy.Configuration;
-using RC_Proxy.Models;
-using System.Text;
-using System.Text.Json;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
 
 namespace RC_Proxy.Services
 {
-    public interface IRabbitMqService
+    public interface IRabbitMqService : IDisposable
     {
-        Task InitializeAsync();
-        Task PublishRcMessageAsync(RcMessage message);
-        Task PublishCcgMessageAsync(CcgMessageInfo ccgMessage);
-        Task<IDisposable> SubscribeToCcgMessagesAsync(Func<CcgMessageInfo, Task> onMessage);
-        Task<IDisposable> SubscribeToAllMessagesAsync(Func<RcMessage, Task> onMessage);
-        void Dispose();
+        Task<bool> InitializeAsync();
+        Task StoreCcgMessageAsync(StoredCcgMessage message);
+        Task<List<StoredCcgMessage>> GetCcgMessagesAsync(uint fromSequenceNumber = 0, int limit = 1000);
+        Task<uint> GetLatestSequenceNumberAsync();
+        Task<bool> IsHealthyAsync();
     }
 
     public class RabbitMqService : IRabbitMqService, IDisposable
     {
+        private readonly RabbitMqConfig _config;
         private readonly ILogger<RabbitMqService> _logger;
-        private readonly RabbitMqConfiguration _config;
-        private IConnection _connection;
-        private IModel _channel;
-        private bool _disposed;
+        
+        private IConnection? _connection;
+        private IModel? _channel;
+        private readonly object _lock = new object();
+        private bool _disposed = false;
+        
+        // In-memory cache for quick lookups
+        private readonly ConcurrentDictionary<uint, StoredCcgMessage> _messageCache 
+            = new ConcurrentDictionary<uint, StoredCcgMessage>();
+        private uint _latestSequenceNumber = 0;
 
-        public RabbitMqService(
-            ILogger<RabbitMqService> logger,
-            IOptions<RabbitMqConfiguration> config)
+        public RabbitMqService(IOptions<RabbitMqConfig> config, ILogger<RabbitMqService> logger)
         {
-            _logger = logger;
             _config = config.Value;
+            _logger = logger;
         }
 
-        public async Task InitializeAsync()
+        public async Task<bool> InitializeAsync()
         {
             try
             {
+                _logger.LogInformation("Initializing RabbitMQ connection to {Host}:{Port}", 
+                    _config.HostName, _config.Port);
+
                 var factory = new ConnectionFactory()
                 {
                     HostName = _config.HostName,
@@ -50,235 +55,244 @@ namespace RC_Proxy.Services
                     Password = _config.Password,
                     VirtualHost = _config.VirtualHost,
                     AutomaticRecoveryEnabled = true,
-                    NetworkRecoveryInterval = TimeSpan.FromSeconds(10)
+                    NetworkRecoveryInterval = TimeSpan.FromSeconds(10),
+                    RequestedHeartbeat = TimeSpan.FromSeconds(60)
                 };
 
-                _connection = factory.CreateConnection("RC_Proxy");
+                _connection = factory.CreateConnection();
                 _channel = _connection.CreateModel();
 
                 // Declare exchange
                 _channel.ExchangeDeclare(
-                    exchange: _config.ExchangeName,
-                    type: ExchangeType.Topic,
+                    exchange: _config.CcgMessagesExchange,
+                    type: ExchangeType.Direct,
                     durable: true,
                     autoDelete: false);
 
-                // Declare queues
-                var queueArgs = new Dictionary<string, object>();
-                if (_config.EnableMessagePersistence)
+                // Declare queue with TTL and size limits
+                var queueArgs = new Dictionary<string, object>
                 {
-                    queueArgs.Add("x-message-ttl", _config.MessageTtlMinutes * 60 * 1000);
-                }
+                    ["x-message-ttl"] = _config.MessageTtlHours * 60 * 60 * 1000,
+                    ["x-max-length"] = _config.MaxQueueSize,
+                    ["x-overflow"] = "drop-head" // Remove oldest messages when queue is full
+                };
 
-                // CCG Messages queue
                 _channel.QueueDeclare(
-                    queue: _config.CcgQueueName,
+                    queue: _config.CcgMessagesQueue,
                     durable: true,
                     exclusive: false,
                     autoDelete: false,
                     arguments: queueArgs);
 
+                // Bind queue to exchange
                 _channel.QueueBind(
-                    queue: _config.CcgQueueName,
-                    exchange: _config.ExchangeName,
-                    routingKey: "ccg.*");
+                    queue: _config.CcgMessagesQueue,
+                    exchange: _config.CcgMessagesExchange,
+                    routingKey: _config.CcgMessagesRoutingKey);
 
-                // All RC Messages queue
-                _channel.QueueDeclare(
-                    queue: _config.AllMessagesQueueName,
-                    durable: true,
-                    exclusive: false,
-                    autoDelete: false,
-                    arguments: queueArgs);
+                _logger.LogInformation("RabbitMQ initialized successfully");
 
-                _channel.QueueBind(
-                    queue: _config.AllMessagesQueueName,
-                    exchange: _config.ExchangeName,
-                    routingKey: "rc.*");
+                // Load recent messages into cache
+                await LoadRecentMessagesIntoCache();
 
-                _logger.LogInformation("RabbitMQ connection established and queues configured");
+                return true;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to initialize RabbitMQ connection");
+                _logger.LogError(ex, "Failed to initialize RabbitMQ");
+                return false;
+            }
+        }
+
+        public async Task StoreCcgMessageAsync(StoredCcgMessage message)
+        {
+            if (_channel == null)
+            {
+                _logger.LogWarning("Cannot store message - RabbitMQ not initialized");
+                return;
+            }
+
+            try
+            {
+                var messageBody = message.ToBytes();
+                var properties = _channel.CreateBasicProperties();
+                properties.Persistent = true;
+                properties.Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+                properties.MessageId = message.SequenceNumber.ToString();
+
+                lock (_lock)
+                {
+                    _channel.BasicPublish(
+                        exchange: _config.CcgMessagesExchange,
+                        routingKey: _config.CcgMessagesRoutingKey,
+                        basicProperties: properties,
+                        body: messageBody);
+                }
+
+                // Update cache
+                _messageCache.TryAdd(message.SequenceNumber, message);
+                if (message.SequenceNumber > _latestSequenceNumber)
+                {
+                    _latestSequenceNumber = message.SequenceNumber;
+                }
+
+                _logger.LogDebug("Stored CCG message with sequence number {SequenceNumber}", 
+                    message.SequenceNumber);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to store CCG message with sequence number {SequenceNumber}", 
+                    message.SequenceNumber);
                 throw;
             }
         }
 
-        public async Task PublishRcMessageAsync(RcMessage message)
+        public async Task<List<StoredCcgMessage>> GetCcgMessagesAsync(uint fromSequenceNumber = 0, int limit = 1000)
         {
-            if (_disposed || _channel == null)
-                return;
+            var messages = new List<StoredCcgMessage>();
 
             try
             {
-                var messageBody = JsonSerializer.Serialize(new
+                // First, try to get messages from cache
+                var cachedMessages = _messageCache.Values
+                    .Where(m => m.SequenceNumber >= fromSequenceNumber)
+                    .OrderBy(m => m.SequenceNumber)
+                    .Take(limit)
+                    .ToList();
+
+                if (cachedMessages.Count >= limit || fromSequenceNumber > _latestSequenceNumber)
                 {
-                    message.Header,
-                    BlockCount = message.Blocks.Count,
-                    message.ReceivedTime,
-                    message.ConnectionId,
-                    message.Direction,
-                    HasCcgMessages = message.Blocks.Any(b => b.IsCcgMessage),
-                    RawDataLength = message.RawData.Length,
-                    RawDataBase64 = Convert.ToBase64String(message.RawData)
-                });
+                    _logger.LogDebug("Retrieved {Count} messages from cache (from seq {FromSeq})", 
+                        cachedMessages.Count, fromSequenceNumber);
+                    return cachedMessages;
+                }
 
-                var body = Encoding.UTF8.GetBytes(messageBody);
-                var routingKey = $"rc.{message.Direction.ToString().ToLower()}.{message.ConnectionId}";
-
-                var properties = _channel.CreateBasicProperties();
-                properties.Persistent = _config.EnableMessagePersistence;
-                properties.Timestamp = new AmqpTimestamp(
-                    ((DateTimeOffset)message.ReceivedTime).ToUnixTimeSeconds());
-                properties.Headers = new Dictionary<string, object>
-                {
-                    ["connection_id"] = message.ConnectionId,
-                    ["direction"] = message.Direction.ToString(),
-                    ["sequence_number"] = message.Header.SequenceNumber,
-                    ["block_count"] = message.Blocks.Count
-                };
-
-                _channel.BasicPublish(
-                    exchange: _config.ExchangeName,
-                    routingKey: routingKey,
-                    basicProperties: properties,
-                    body: body);
-
-                _logger.LogDebug($"Published RC message: {routingKey}");
+                // If cache doesn't have enough messages, read from RabbitMQ
+                messages = await ReadMessagesFromQueue(fromSequenceNumber, limit);
+                
+                _logger.LogDebug("Retrieved {Count} messages from RabbitMQ (from seq {FromSeq})", 
+                    messages.Count, fromSequenceNumber);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"Failed to publish RC message for connection {message.ConnectionId}");
+                _logger.LogError(ex, "Failed to get CCG messages from sequence {FromSeq}", fromSequenceNumber);
+                throw;
             }
+
+            return messages;
         }
 
-        public async Task PublishCcgMessageAsync(CcgMessageInfo ccgMessage)
+        private async Task<List<StoredCcgMessage>> ReadMessagesFromQueue(uint fromSequenceNumber, int limit)
         {
-            if (_disposed || _channel == null)
-                return;
+            var messages = new List<StoredCcgMessage>();
+            
+            if (_channel == null) return messages;
 
             try
             {
-                var messageBody = JsonSerializer.Serialize(new
-                {
-                    ccgMessage.SequenceNumber,
-                    ccgMessage.ReceivedTime,
-                    ccgMessage.ConnectionId,
-                    ccgMessage.MessageType,
-                    ccgMessage.MessageName,
-                    ccgMessage.InstrumentId,
-                    CcgDataBase64 = Convert.ToBase64String(ccgMessage.CcgData),
-                    CcgDataLength = ccgMessage.CcgData.Length
-                });
+                // Create a temporary consumer to read messages
+                var tempQueueName = _channel.QueueDeclare().QueueName;
+                var consumer = new EventingBasicConsumer(_channel);
+                var receivedMessages = new List<BasicDeliverEventArgs>();
 
-                var body = Encoding.UTF8.GetBytes(messageBody);
-                var routingKey = $"ccg.{ccgMessage.MessageName.ToLower()}.{ccgMessage.ConnectionId}";
-
-                var properties = _channel.CreateBasicProperties();
-                properties.Persistent = _config.EnableMessagePersistence;
-                properties.Timestamp = new AmqpTimestamp(
-                    ((DateTimeOffset)ccgMessage.ReceivedTime).ToUnixTimeSeconds());
-                properties.Headers = new Dictionary<string, object>
+                consumer.Received += (model, ea) =>
                 {
-                    ["connection_id"] = ccgMessage.ConnectionId,
-                    ["message_type"] = ccgMessage.MessageType,
-                    ["message_name"] = ccgMessage.MessageName,
-                    ["sequence_number"] = ccgMessage.SequenceNumber
+                    receivedMessages.Add(ea);
                 };
 
-                if (ccgMessage.InstrumentId.HasValue)
+                // Start consuming
+                var consumerTag = _channel.BasicConsume(
+                    queue: _config.CcgMessagesQueue,
+                    autoAck: false,
+                    consumer: consumer);
+
+                // Read messages for a short time
+                await Task.Delay(1000);
+
+                // Stop consuming
+                _channel.BasicCancel(consumerTag);
+
+                // Process received messages
+                foreach (var ea in receivedMessages)
                 {
-                    properties.Headers["instrument_id"] = ccgMessage.InstrumentId.Value;
+                    try
+                    {
+                        var message = StoredCcgMessage.FromBytes(ea.Body.ToArray());
+                        if (message.SequenceNumber >= fromSequenceNumber)
+                        {
+                            messages.Add(message);
+                        }
+                        
+                        // Acknowledge the message
+                        _channel.BasicAck(ea.DeliveryTag, false);
+                        
+                        if (messages.Count >= limit) break;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Failed to deserialize message");
+                        _channel.BasicNack(ea.DeliveryTag, false, false);
+                    }
                 }
 
-                _channel.BasicPublish(
-                    exchange: _config.ExchangeName,
-                    routingKey: routingKey,
-                    basicProperties: properties,
-                    body: body);
-
-                _logger.LogDebug($"Published CCG message: {routingKey}");
+                messages = messages.OrderBy(m => m.SequenceNumber).ToList();
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"Failed to publish CCG message for connection {ccgMessage.ConnectionId}");
+                _logger.LogError(ex, "Failed to read messages from queue");
+                throw;
+            }
+
+            return messages;
+        }
+
+        public async Task<uint> GetLatestSequenceNumberAsync()
+        {
+            return _latestSequenceNumber;
+        }
+
+        private async Task LoadRecentMessagesIntoCache()
+        {
+            try
+            {
+                _logger.LogInformation("Loading recent messages into cache...");
+                
+                // Load last 1000 messages into cache for fast access
+                var recentMessages = await ReadMessagesFromQueue(0, 1000);
+                
+                foreach (var message in recentMessages)
+                {
+                    _messageCache.TryAdd(message.SequenceNumber, message);
+                    if (message.SequenceNumber > _latestSequenceNumber)
+                    {
+                        _latestSequenceNumber = message.SequenceNumber;
+                    }
+                }
+
+                _logger.LogInformation("Loaded {Count} messages into cache, latest seq: {LatestSeq}", 
+                    recentMessages.Count, _latestSequenceNumber);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to load recent messages into cache");
             }
         }
 
-        public async Task<IDisposable> SubscribeToCcgMessagesAsync(Func<CcgMessageInfo, Task> onMessage)
+        public async Task<bool> IsHealthyAsync()
         {
-            if (_disposed || _channel == null)
-                throw new InvalidOperationException("RabbitMQ service not initialized");
-
-            var consumer = new AsyncEventingBasicConsumer(_channel);
-            consumer.Received += async (model, ea) =>
+            try
             {
-                try
-                {
-                    var body = ea.Body.ToArray();
-                    var message = Encoding.UTF8.GetString(body);
-                    var ccgInfo = JsonSerializer.Deserialize<CcgMessageInfo>(message);
-                    
-                    // Decode base64 CCG data
-                    if (ccgInfo != null)
-                    {
-                        await onMessage(ccgInfo);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error processing CCG message from queue");
-                }
-            };
-
-            var consumerTag = _channel.BasicConsume(
-                queue: _config.CcgQueueName,
-                autoAck: true,
-                consumer: consumer);
-
-            return new RabbitMqSubscription(_channel, consumerTag, _logger);
-        }
-
-        public async Task<IDisposable> SubscribeToAllMessagesAsync(Func<RcMessage, Task> onMessage)
-        {
-            if (_disposed || _channel == null)
-                throw new InvalidOperationException("RabbitMQ service not initialized");
-
-            var consumer = new AsyncEventingBasicConsumer(_channel);
-            consumer.Received += async (model, ea) =>
+                return _connection?.IsOpen == true && _channel?.IsOpen == true;
+            }
+            catch
             {
-                try
-                {
-                    var body = ea.Body.ToArray();
-                    var message = Encoding.UTF8.GetString(body);
-                    var rcMessage = JsonSerializer.Deserialize<RcMessage>(message);
-                    
-                    if (rcMessage != null)
-                    {
-                        await onMessage(rcMessage);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error processing RC message from queue");
-                }
-            };
-
-            var consumerTag = _channel.BasicConsume(
-                queue: _config.AllMessagesQueueName,
-                autoAck: true,
-                consumer: consumer);
-
-            return new RabbitMqSubscription(_channel, consumerTag, _logger);
+                return false;
+            }
         }
 
         public void Dispose()
         {
-            if (_disposed)
-                return;
-
-            _disposed = true;
+            if (_disposed) return;
 
             try
             {
@@ -286,176 +300,13 @@ namespace RC_Proxy.Services
                 _channel?.Dispose();
                 _connection?.Close();
                 _connection?.Dispose();
-
-                _logger.LogInformation("RabbitMQ connection closed");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error disposing RabbitMQ connection");
+                _logger.LogError(ex, "Error disposing RabbitMQ resources");
             }
-        }
-    }
-
-    public class RabbitMqSubscription : IDisposable
-    {
-        private readonly IModel _channel;
-        private readonly string _consumerTag;
-        private readonly ILogger _logger;
-        private bool _disposed;
-
-        public RabbitMqSubscription(IModel channel, string consumerTag, ILogger logger)
-        {
-            _channel = channel;
-            _consumerTag = consumerTag;
-            _logger = logger;
-        }
-
-        public void Dispose()
-        {
-            if (_disposed)
-                return;
 
             _disposed = true;
-
-            try
-            {
-                _channel?.BasicCancel(_consumerTag);
-                _logger.LogDebug($"Cancelled RabbitMQ consumer: {_consumerTag}");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, $"Error cancelling RabbitMQ consumer: {_consumerTag}");
-            }
-        }
-    }
-
-    // RC_Proxy/Services/ConnectionManager.cs
-    public interface IConnectionManager
-    {
-        void AddConnection(ProxyConnection connection);
-        void RemoveConnection(string connectionId);
-        ProxyConnection GetConnection(string connectionId);
-        List<ProxyConnection> GetAllConnections();
-        Task CloseAllConnectionsAsync();
-        int ActiveConnectionCount { get; }
-    }
-
-    public class ConnectionManager : IConnectionManager
-    {
-        private readonly ILogger<ConnectionManager> _logger;
-        private readonly Dictionary<string, ProxyConnection> _connections = new();
-        private readonly object _lock = new();
-
-        public int ActiveConnectionCount
-        {
-            get
-            {
-                lock (_lock)
-                {
-                    return _connections.Count;
-                }
-            }
-        }
-
-        public ConnectionManager(ILogger<ConnectionManager> logger)
-        {
-            _logger = logger;
-        }
-
-        public void AddConnection(ProxyConnection connection)
-        {
-            lock (_lock)
-            {
-                _connections[connection.ConnectionId] = connection;
-                _logger.LogInformation($"Added connection {connection.ConnectionId}. Total active: {_connections.Count}");
-            }
-        }
-
-        public void RemoveConnection(string connectionId)
-        {
-            lock (_lock)
-            {
-                if (_connections.Remove(connectionId))
-                {
-                    _logger.LogInformation($"Removed connection {connectionId}. Total active: {_connections.Count}");
-                }
-            }
-        }
-
-        public ProxyConnection GetConnection(string connectionId)
-        {
-            lock (_lock)
-            {
-                _connections.TryGetValue(connectionId, out var connection);
-                return connection;
-            }
-        }
-
-        public List<ProxyConnection> GetAllConnections()
-        {
-            lock (_lock)
-            {
-                return new List<ProxyConnection>(_connections.Values);
-            }
-        }
-
-        public async Task CloseAllConnectionsAsync()
-        {
-            List<ProxyConnection> connections;
-            
-            lock (_lock)
-            {
-                connections = new List<ProxyConnection>(_connections.Values);
-                _connections.Clear();
-            }
-
-            foreach (var connection in connections)
-            {
-                try
-                {
-                    connection.Dispose();
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, $"Error closing connection {connection.ConnectionId}");
-                }
-            }
-
-            _logger.LogInformation($"Closed {connections.Count} connections");
-        }
-    }
-
-    // RC_Proxy/Models/ProxyConnection.cs
-    public class ProxyConnection : IDisposable
-    {
-        public string ConnectionId { get; set; }
-        public TcpClient ClientSocket { get; set; }
-        public TcpClient ServerSocket { get; set; }
-        public NetworkStream ClientStream { get; set; }
-        public NetworkStream ServerStream { get; set; }
-        public DateTime ConnectedTime { get; set; }
-        public long BytesClientToServer { get; set; }
-        public long BytesServerToClient { get; set; }
-        private bool _disposed;
-
-        public void Dispose()
-        {
-            if (_disposed)
-                return;
-
-            _disposed = true;
-
-            try
-            {
-                ClientStream?.Close();
-                ServerStream?.Close();
-                ClientSocket?.Close();
-                ServerSocket?.Close();
-            }
-            catch
-            {
-                // Ignore errors during cleanup
-            }
         }
     }
 }

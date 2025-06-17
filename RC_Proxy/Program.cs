@@ -1,9 +1,10 @@
-﻿using Microsoft.Extensions.DependencyInjection;
+﻿using System;
+using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using RC_Proxy.Services;
-using RC_Proxy.Configuration;
 using Microsoft.Extensions.Configuration;
+using RC_Proxy.Services;
 
 namespace RC_Proxy
 {
@@ -14,7 +15,7 @@ namespace RC_Proxy
             var host = CreateHostBuilder(args).Build();
             
             var logger = host.Services.GetRequiredService<ILogger<Program>>();
-            logger.LogInformation("Starting RC_Proxy Server...");
+            logger.LogInformation("RC_Proxy starting...");
             
             try
             {
@@ -22,37 +23,35 @@ namespace RC_Proxy
             }
             catch (Exception ex)
             {
-                logger.LogCritical(ex, "RC_Proxy Server failed to start or crashed");
+                logger.LogCritical(ex, "RC_Proxy terminated unexpectedly");
+                throw;
             }
         }
 
-        public static IHostBuilder CreateHostBuilder(string[] args) =>
+        private static IHostBuilder CreateHostBuilder(string[] args) =>
             Host.CreateDefaultBuilder(args)
                 .ConfigureAppConfiguration((context, config) =>
                 {
                     config.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
-                    config.AddJsonFile($"appsettings.{context.HostingEnvironment.EnvironmentName}.json", 
-                                     optional: true, reloadOnChange: true);
                     config.AddEnvironmentVariables();
                     config.AddCommandLine(args);
                 })
                 .ConfigureServices((context, services) =>
                 {
-                    // Configuration
-                    services.Configure<ProxyConfiguration>(
-                        context.Configuration.GetSection("ProxyConfiguration"));
-                    services.Configure<RabbitMqConfiguration>(
-                        context.Configuration.GetSection("RabbitMq"));
+                    var configuration = context.Configuration;
+                    
+                    // Configuration sections
+                    services.Configure<RcProxyConfig>(configuration.GetSection("RcProxy"));
+                    services.Configure<RabbitMqConfig>(configuration.GetSection("RabbitMQ"));
                     
                     // Services
-                    services.AddSingleton<IRcMessageProcessor, RcMessageProcessor>();
                     services.AddSingleton<IRabbitMqService, RabbitMqService>();
-                    services.AddSingleton<ITcpProxyService, TcpProxyService>();
-                    services.AddSingleton<IConnectionManager, ConnectionManager>();
+                    services.AddSingleton<IMessageRouter, MessageRouter>();
+                    services.AddSingleton<IRewindHandler, RewindHandler>();
+                    services.AddSingleton<IRcConnectionManager, RcConnectionManager>();
                     
-                    // Background Services
-                    services.AddHostedService<ProxyServerHostedService>();
-                    services.AddHostedService<RabbitMqPublisherService>();
+                    // Hosted services
+                    services.AddHostedService<RcProxyService>();
                 })
                 .ConfigureLogging(logging =>
                 {
