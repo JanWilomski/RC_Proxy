@@ -1,6 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace RC_Proxy.Services
 {
@@ -130,22 +133,104 @@ namespace RC_Proxy.Services
     public class StoredCcgMessage
     {
         public uint SequenceNumber { get; set; }
-        public byte[] CcgData { get; set; } = Array.Empty<byte>();
+        
+        // Używamy Base64 zamiast byte[] dla JSON
+        public string CcgDataBase64 { get; set; } = "";
+        
+        // Helper property dla kompatybilności wstecznej
+        [System.Text.Json.Serialization.JsonIgnore]
+        public byte[] CcgData 
+        { 
+            get => string.IsNullOrEmpty(CcgDataBase64) ? Array.Empty<byte>() : Convert.FromBase64String(CcgDataBase64);
+            set => CcgDataBase64 = value.Length == 0 ? "" : Convert.ToBase64String(value);
+        }
+        
         public DateTime StoredTime { get; set; } = DateTime.UtcNow;
         public string SessionId { get; set; } = "";
         public ushort MessageType { get; set; }
         public uint InstrumentId { get; set; }
         public string MessageName { get; set; } = "";
         
+        // Maksymalny rozmiar wiadomości (256KB)
+        private const int MAX_MESSAGE_SIZE = 256 * 1024;
+        
         public byte[] ToBytes()
         {
-            return System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(this);
+            try
+            {
+                var options = new JsonSerializerOptions
+                {
+                    WriteIndented = false,
+                    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+                    Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+                };
+                
+                var jsonBytes = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(this, options);
+                
+                // Walidacja rozmiaru
+                if (jsonBytes.Length > MAX_MESSAGE_SIZE)
+                {
+                    throw new InvalidOperationException($"Message too large: {jsonBytes.Length} bytes (max: {MAX_MESSAGE_SIZE})");
+                }
+                
+                // Walidacja poprawności JSON
+                var jsonString = System.Text.Encoding.UTF8.GetString(jsonBytes);
+                if (!jsonString.EndsWith("}"))
+                {
+                    throw new InvalidOperationException($"Invalid JSON - doesn't end with }}: {jsonString}");
+                }
+                
+                return jsonBytes;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"Failed to serialize StoredCcgMessage (SeqNum: {SequenceNumber}): {ex.Message}", ex);
+            }
         }
         
         public static StoredCcgMessage FromBytes(byte[] data)
         {
-            return System.Text.Json.JsonSerializer.Deserialize<StoredCcgMessage>(data) 
-                ?? throw new InvalidOperationException("Failed to deserialize StoredCcgMessage");
+            try
+            {
+                if (data == null || data.Length == 0)
+                    throw new ArgumentException("Data cannot be null or empty");
+                
+                if (data.Length > MAX_MESSAGE_SIZE)
+                    throw new ArgumentException($"Data too large: {data.Length} bytes");
+                    
+                // Sprawdź czy JSON jest kompletny
+                var jsonString = System.Text.Encoding.UTF8.GetString(data);
+                if (string.IsNullOrWhiteSpace(jsonString))
+                    throw new ArgumentException("JSON string is empty or whitespace");
+                    
+                jsonString = jsonString.Trim();
+                if (!jsonString.StartsWith("{") || !jsonString.EndsWith("}"))
+                    throw new ArgumentException($"Invalid JSON structure: starts with '{jsonString.FirstOrDefault()}', ends with '{jsonString.LastOrDefault()}'");
+                
+                var options = new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true,
+                    AllowTrailingCommas = true,
+                    ReadCommentHandling = JsonCommentHandling.Skip
+                };
+                
+                var result = System.Text.Json.JsonSerializer.Deserialize<StoredCcgMessage>(data, options);
+                
+                if (result == null)
+                    throw new InvalidOperationException("Deserialization returned null");
+                
+                return result;
+            }
+            catch (JsonException ex)
+            {
+                var jsonString = System.Text.Encoding.UTF8.GetString(data);
+                var preview = jsonString.Length > 500 ? jsonString[..500] + "..." : jsonString;
+                throw new InvalidOperationException($"JSON deserialization failed: {ex.Message}. JSON preview: {preview}", ex);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"Failed to deserialize StoredCcgMessage: {ex.Message}", ex);
+            }
         }
     }
 

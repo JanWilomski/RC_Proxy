@@ -112,40 +112,105 @@ namespace RC_Proxy.Services
                 return;
             }
 
-            try
+            const int MAX_RETRIES = 3;
+            var attempt = 0;
+            
+            while (attempt < MAX_RETRIES)
             {
-                var messageBody = message.ToBytes();
-                var properties = _channel.CreateBasicProperties();
-                properties.Persistent = true;
-                properties.Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
-                properties.MessageId = message.SequenceNumber.ToString();
-
-                lock (_lock)
+                try
                 {
-                    _channel.BasicPublish(
-                        exchange: _config.CcgMessagesExchange,
-                        routingKey: _config.CcgMessagesRoutingKey,
-                        basicProperties: properties,
-                        body: messageBody);
-                }
+                    // Walidacja wejściowej wiadomości
+                    if (message.SequenceNumber == 0)
+                    {
+                        _logger.LogWarning("Attempting to store message with SequenceNumber 0");
+                    }
+                    
+                    // Serializacja z walidacją
+                    var messageBody = message.ToBytes();
+                    _logger.LogTrace("Serialized message {SeqNum} to {Size} bytes", 
+                        message.SequenceNumber, messageBody.Length);
+                    
+                    // Waliduj ponownie po serializacji
+                    var testDeserialize = StoredCcgMessage.FromBytes(messageBody);
+                    if (testDeserialize.SequenceNumber != message.SequenceNumber)
+                    {
+                        throw new InvalidOperationException($"Serialization validation failed: expected SeqNum {message.SequenceNumber}, got {testDeserialize.SequenceNumber}");
+                    }
+                    
+                    var properties = _channel.CreateBasicProperties();
+                    properties.Persistent = true;
+                    properties.Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+                    properties.MessageId = message.SequenceNumber.ToString();
+                    properties.ContentType = "application/json";
+                    properties.ContentEncoding = "UTF-8";
+                    
+                    // Dodatkowe właściwości dla diagnostyki
+                    properties.Headers = new Dictionary<string, object>
+                    {
+                        ["OriginalSize"] = messageBody.Length,
+                        ["MessageType"] = message.MessageType,
+                        ["StoredAt"] = message.StoredTime.ToString("O")
+                    };
 
-                // Update cache
-                _messageCache.TryAdd(message.SequenceNumber, message);
-                if (message.SequenceNumber > _latestSequenceNumber)
+                    lock (_lock)
+                    {
+                        _channel.BasicPublish(
+                            exchange: _config.CcgMessagesExchange,
+                            routingKey: _config.CcgMessagesRoutingKey,
+                            basicProperties: properties,
+                            body: messageBody);
+                    }
+
+                    // Weryfikacja przez natychmiastowy odczyt (opcjonalne dla krytycznych aplikacji)
+                    if (_logger.IsEnabled(LogLevel.Trace))
+                    {
+                        try
+                        {
+                            await Task.Delay(10); // Krótkie opóźnienie
+                            var verification = _channel.BasicGet(_config.CcgMessagesQueue, false);
+                            if (verification != null)
+                            {
+                                var verifiedMessage = StoredCcgMessage.FromBytes(verification.Body.ToArray());
+                                _logger.LogTrace("Verified stored message {SeqNum} successfully", verifiedMessage.SequenceNumber);
+                                _channel.BasicNack(verification.DeliveryTag, false, true); // Zwróć do kolejki
+                            }
+                        }
+                        catch (Exception verifyEx)
+                        {
+                            _logger.LogWarning(verifyEx, "Verification of stored message failed (non-critical)");
+                        }
+                    }
+
+                    // Update cache
+                    _messageCache.TryAdd(message.SequenceNumber, message);
+                    if (message.SequenceNumber > _latestSequenceNumber)
+                    {
+                        _latestSequenceNumber = message.SequenceNumber;
+                    }
+
+                    _logger.LogDebug("Successfully stored CCG message with sequence number {SequenceNumber} ({Size} bytes)", 
+                        message.SequenceNumber, messageBody.Length);
+                    
+                    return; // Sukces - wyjdź z pętli retry
+                }
+                catch (Exception ex)
                 {
-                    _latestSequenceNumber = message.SequenceNumber;
+                    attempt++;
+                    _logger.LogError(ex, "Failed to store CCG message with sequence number {SequenceNumber} (attempt {Attempt}/{MaxRetries})", 
+                        message.SequenceNumber, attempt, MAX_RETRIES);
+                    
+                    if (attempt >= MAX_RETRIES)
+                    {
+                        _logger.LogCritical("Failed to store CCG message after {MaxRetries} attempts, giving up", MAX_RETRIES);
+                        throw new InvalidOperationException($"Failed to store message after {MAX_RETRIES} attempts: {ex.Message}", ex);
+                    }
+                    
+                    // Exponential backoff
+                    await Task.Delay(TimeSpan.FromMilliseconds(100 * Math.Pow(2, attempt - 1)));
                 }
-
-                _logger.LogDebug("Stored CCG message with sequence number {SequenceNumber}", 
-                    message.SequenceNumber);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to store CCG message with sequence number {SequenceNumber}", 
-                    message.SequenceNumber);
-                throw;
             }
         }
+
 
         public async Task<List<StoredCcgMessage>> GetCcgMessagesAsync(uint fromSequenceNumber = 0, int limit = 1000)
         {
@@ -181,65 +246,118 @@ namespace RC_Proxy.Services
 
             return messages;
         }
-
+        
         private async Task<List<StoredCcgMessage>> ReadMessagesFromQueue(uint fromSequenceNumber, int limit)
         {
             var messages = new List<StoredCcgMessage>();
             
-            if (_channel == null) return messages;
+            if (_channel == null) 
+            {
+                _logger.LogWarning("Cannot read messages - channel is null");
+                return messages;
+            }
 
             try
             {
-                // Create a temporary consumer to read messages
-                var tempQueueName = _channel.QueueDeclare().QueueName;
-                var consumer = new EventingBasicConsumer(_channel);
-                var receivedMessages = new List<BasicDeliverEventArgs>();
-
-                consumer.Received += (model, ea) =>
+                _logger.LogDebug("Reading messages from queue {Queue}, fromSeq: {FromSeq}, limit: {Limit}", 
+                    _config.CcgMessagesQueue, fromSequenceNumber, limit);
+                
+                var processedCount = 0;
+                var skippedCount = 0;
+                var errorCount = 0;
+                var maxAttempts = limit * 3; // Zabezpieczenie przed nieskończoną pętlą
+                
+                for (int attempt = 0; attempt < maxAttempts && processedCount < limit; attempt++)
                 {
-                    receivedMessages.Add(ea);
-                };
-
-                // Start consuming
-                var consumerTag = _channel.BasicConsume(
-                    queue: _config.CcgMessagesQueue,
-                    autoAck: false,
-                    consumer: consumer);
-
-                // Read messages for a short time
-                await Task.Delay(1000);
-
-                // Stop consuming
-                _channel.BasicCancel(consumerTag);
-
-                // Process received messages
-                foreach (var ea in receivedMessages)
-                {
+                    var result = _channel.BasicGet(_config.CcgMessagesQueue, false);
+                    
+                    if (result == null)
+                    {
+                        _logger.LogDebug("No more messages in queue after {Attempts} attempts", attempt);
+                        break;
+                    }
+                    
                     try
                     {
-                        var message = StoredCcgMessage.FromBytes(ea.Body.ToArray());
+                        if (result.Body.Length == 0)
+                        {
+                            _logger.LogWarning("Received empty message body, acknowledging and skipping");
+                            _channel.BasicAck(result.DeliveryTag, false);
+                            skippedCount++;
+                            continue;
+                        }
+                        
+                        // Loguj rozmiar wiadomości
+                        _logger.LogTrace("Processing message: delivery tag {DeliveryTag}, size {Size} bytes", 
+                            result.DeliveryTag, result.Body.Length);
+                        
+                        // Sprawdź czy wiadomość nie jest obcięta
+                        var bodyArray = result.Body.ToArray();
+                        var jsonString = System.Text.Encoding.UTF8.GetString(bodyArray);
+                        
+                        if (!jsonString.TrimEnd().EndsWith("}"))
+                        {
+                            _logger.LogError("Message appears truncated - doesn't end with }}: {JsonPreview}...", 
+                                jsonString.Length > 100 ? jsonString[..100] : jsonString);
+                            _channel.BasicNack(result.DeliveryTag, false, false); // Usuń uszkodzoną wiadomość
+                            errorCount++;
+                            continue;
+                        }
+                        
+                        var message = StoredCcgMessage.FromBytes(bodyArray);
+                        
                         if (message.SequenceNumber >= fromSequenceNumber)
                         {
                             messages.Add(message);
+                            processedCount++;
+                        }
+                        else
+                        {
+                            skippedCount++;
                         }
                         
-                        // Acknowledge the message
-                        _channel.BasicAck(ea.DeliveryTag, false);
-                        
-                        if (messages.Count >= limit) break;
+                        _channel.BasicAck(result.DeliveryTag, false);
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "Failed to deserialize message");
-                        _channel.BasicNack(ea.DeliveryTag, false, false);
+                        errorCount++;
+                        _logger.LogError(ex, "Failed to process message with delivery tag {DeliveryTag}, size {Size}. Error count: {ErrorCount}", 
+                            result.DeliveryTag, result.Body.Length, errorCount);
+                        
+                        // Log raw data for debugging
+                        if (_logger.IsEnabled(LogLevel.Debug))
+                        {
+                            try
+                            {
+                                var rawString = System.Text.Encoding.UTF8.GetString(result.Body.ToArray());
+                                var preview = rawString.Length > 200 ? rawString[..200] + "..." : rawString;
+                                _logger.LogDebug("Raw message data: {RawData}", preview.Replace("\n", "\\n").Replace("\r", "\\r"));
+                            }
+                            catch
+                            {
+                                _logger.LogDebug("Could not decode raw message data as UTF-8");
+                            }
+                        }
+                        
+                        _channel.BasicNack(result.DeliveryTag, false, false); // Usuń uszkodzoną wiadomość
+                        
+                        // Jeśli zbyt wiele błędów, przerwij
+                        if (errorCount > limit / 2)
+                        {
+                            _logger.LogError("Too many errors ({ErrorCount}) while reading messages, stopping", errorCount);
+                            break;
+                        }
                     }
                 }
 
                 messages = messages.OrderBy(m => m.SequenceNumber).ToList();
+                
+                _logger.LogInformation("Read {ProcessedCount} messages from queue (skipped: {SkippedCount}, errors: {ErrorCount})", 
+                    processedCount, skippedCount, errorCount);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed to read messages from queue");
+                _logger.LogError(ex, "Critical error while reading messages from queue");
                 throw;
             }
 
