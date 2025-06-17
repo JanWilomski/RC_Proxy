@@ -49,6 +49,9 @@ namespace RC_Proxy.Services
 
                 // Send stored messages
                 uint sequenceNumber = request.LastSeenSequenceNumber + 1;
+                var sentCount = 0;
+                var errorCount = 0;
+                
                 foreach (var storedMessage in storedMessages.OrderBy(m => m.SequenceNumber))
                 {
                     try
@@ -56,29 +59,57 @@ namespace RC_Proxy.Services
                         // Create RC message from stored CCG message
                         var rcMessage = CreateRcMessageFromStoredMessage(storedMessage, sequenceNumber++);
                         
+                        // Validate the created message
+                        if (rcMessage.RawData == null || rcMessage.RawData.Length == 0)
+                        {
+                            _logger.LogError("Created RC message has no raw data for stored message {SeqNum}", storedMessage.SequenceNumber);
+                            errorCount++;
+                            continue;
+                        }
+                        
                         // Send to client
-                        var messageBytes = SerializeRcMessage(rcMessage);
-                        await clientStream.WriteAsync(messageBytes);
+                        await clientStream.WriteAsync(rcMessage.RawData);
                         await clientStream.FlushAsync();
+                        sentCount++;
+                        
+                        _logger.LogTrace("Sent rewind message {SeqNum} to client {ClientId} ({Size} bytes)", 
+                            rcMessage.Header.SequenceNumber, request.ClientId, rcMessage.RawData.Length);
                         
                         // Small delay to prevent overwhelming the client
-                        if (sequenceNumber % 100 == 0)
+                        if (sentCount % 50 == 0)
                         {
-                            await Task.Delay(10);
+                            await Task.Delay(5);
                         }
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogError(ex, "Failed to send rewind message with sequence {SeqNum}", 
-                            storedMessage.SequenceNumber);
+                        errorCount++;
+                        _logger.LogError(ex, "Failed to send rewind message with original sequence {SeqNum} to client {ClientId}", 
+                            storedMessage.SequenceNumber, request.ClientId);
+                        
+                        // If too many errors, stop sending
+                        if (errorCount > 10)
+                        {
+                            _logger.LogError("Too many errors ({ErrorCount}) sending rewind messages, stopping", errorCount);
+                            break;
+                        }
                     }
                 }
 
                 // Send rewind complete message
-                await SendRewindCompleteAsync(clientStream, storedMessages.LastOrDefault()?.SessionId ?? request.ClientId);
+                var lastSessionId = storedMessages.LastOrDefault()?.SessionId ?? "";
+                await SendRewindCompleteAsync(clientStream, lastSessionId);
 
-                _logger.LogInformation("Completed rewind for client {ClientId}, sent {Count} messages", 
-                    request.ClientId, storedMessages.Count);
+                if (errorCount > 0)
+                {
+                    _logger.LogWarning("Completed rewind for client {ClientId}: sent {SentCount}/{TotalCount} messages ({ErrorCount} errors)", 
+                        request.ClientId, sentCount, storedMessages.Count, errorCount);
+                }
+                else
+                {
+                    _logger.LogInformation("Completed rewind for client {ClientId}, sent {Count} messages successfully", 
+                        request.ClientId, sentCount);
+                }
 
                 return true;
             }
@@ -87,6 +118,63 @@ namespace RC_Proxy.Services
                 _logger.LogError(ex, "Failed to handle rewind request for client {ClientId}", request.ClientId);
                 return false;
             }
+        }
+
+        // 4. DODATKOWA METODA DIAGNOSTYCZNA
+        public async Task<Dictionary<string, object>> GetRewindDiagnosticsAsync(uint fromSequenceNumber = 0, int sampleSize = 5)
+        {
+            var diagnostics = new Dictionary<string, object>();
+            
+            try
+            {
+                // Get sample messages from RabbitMQ
+                var storedMessages = await _rabbitMqService.GetCcgMessagesAsync(fromSequenceNumber, sampleSize);
+                
+                diagnostics["SampleSize"] = sampleSize;
+                diagnostics["FoundMessages"] = storedMessages.Count;
+                diagnostics["FromSequenceNumber"] = fromSequenceNumber;
+                
+                var sampleAnalysis = new List<object>();
+                
+                foreach (var storedMessage in storedMessages.Take(sampleSize))
+                {
+                    try
+                    {
+                        // Test reconstruction
+                        var rcMessage = CreateRcMessageFromStoredMessage(storedMessage, storedMessage.SequenceNumber);
+                        
+                        sampleAnalysis.Add(new
+                        {
+                            OriginalSeqNum = storedMessage.SequenceNumber,
+                            SessionId = storedMessage.SessionId,
+                            MessageType = storedMessage.MessageType,
+                            MessageName = storedMessage.MessageName,
+                            CcgDataSize = storedMessage.CcgData?.Length ?? 0,
+                            ReconstructedSize = rcMessage.RawData?.Length ?? 0,
+                            ReconstructionSuccess = rcMessage.RawData != null && rcMessage.RawData.Length > 0
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        sampleAnalysis.Add(new
+                        {
+                            OriginalSeqNum = storedMessage.SequenceNumber,
+                            Error = ex.Message,
+                            ReconstructionSuccess = false
+                        });
+                    }
+                }
+                
+                diagnostics["SampleAnalysis"] = sampleAnalysis;
+                diagnostics["Timestamp"] = DateTime.UtcNow;
+            }
+            catch (Exception ex)
+            {
+                diagnostics["Error"] = ex.Message;
+                diagnostics["StackTrace"] = ex.StackTrace;
+            }
+            
+            return diagnostics;
         }
 
         public async Task<List<RcMessage>> CreateRewindMessagesAsync(uint fromSequenceNumber, string sessionId)
@@ -115,30 +203,56 @@ namespace RC_Proxy.Services
 
         private RcMessage CreateRcMessageFromStoredMessage(StoredCcgMessage storedMessage, uint sequenceNumber)
         {
-            var rcMessage = new RcMessage
+            try
             {
-                Header = new RcHeader
+                // Create RC message header
+                var rcMessage = new RcMessage
                 {
-                    Session = storedMessage.SessionId,
-                    SequenceNumber = sequenceNumber,
-                    BlockCount = 1
-                },
-                ReceivedTime = storedMessage.StoredTime
-            };
-            
-            // Create CCG message block
-            var ccgBlock = new RcBlock
+                    Header = new RcHeader
+                    {
+                        Session = storedMessage.SessionId,
+                        SequenceNumber = sequenceNumber, // Use provided sequence number for rewind
+                        BlockCount = 1
+                    },
+                    ReceivedTime = storedMessage.StoredTime
+                };
+                
+                // Get the original CCG data
+                var ccgData = storedMessage.CcgData;
+                
+                if (ccgData == null || ccgData.Length == 0)
+                {
+                    throw new InvalidOperationException($"Empty CCG data for stored message {storedMessage.SequenceNumber}");
+                }
+                
+                // Create CCG message block with proper RC protocol format
+                // RC Protocol format for CCG messages: 'B' + uint16 length + CCG data
+                var blockPayload = new byte[3 + ccgData.Length];
+                blockPayload[0] = (byte)'B';  // CCG message identifier
+                BitConverter.GetBytes((ushort)ccgData.Length).CopyTo(blockPayload, 1);  // Length of CCG data
+                ccgData.CopyTo(blockPayload, 3);  // Actual CCG data
+                
+                var ccgBlock = new RcBlock
+                {
+                    Length = (ushort)blockPayload.Length,
+                    Payload = blockPayload
+                };
+                
+                rcMessage.Blocks.Add(ccgBlock);
+                
+                // Serialize the complete message to RawData
+                rcMessage.RawData = SerializeRcMessage(rcMessage);
+                
+                _logger.LogTrace("Created RC message from stored CCG message: SeqNum={OriginalSeq}->{NewSeq}, Size={Size} bytes", 
+                    storedMessage.SequenceNumber, sequenceNumber, rcMessage.RawData.Length);
+                
+                return rcMessage;
+            }
+            catch (Exception ex)
             {
-                Length = (ushort)storedMessage.CcgData.Length,
-                Payload = storedMessage.CcgData
-            };
-            
-            rcMessage.Blocks.Add(ccgBlock);
-            
-            // Serialize the complete message
-            rcMessage.RawData = SerializeRcMessage(rcMessage);
-            
-            return rcMessage;
+                _logger.LogError(ex, "Failed to create RC message from stored CCG message {SeqNum}", storedMessage.SequenceNumber);
+                throw new InvalidOperationException($"Failed to create RC message: {ex.Message}", ex);
+            }
         }
 
         private byte[] SerializeRcMessage(RcMessage message)
@@ -262,30 +376,83 @@ namespace RC_Proxy.Services
             };
 
             // Extract CCG data from the block
+            // Format: 'B' + uint16 length + CCG binary data
             if (ccgBlock.Payload.Length >= 3)
             {
                 ushort ccgLength = BitConverter.ToUInt16(ccgBlock.Payload, 1);
+                
                 if (ccgBlock.Payload.Length >= 3 + ccgLength)
                 {
-                    storedMessage.CcgData = new byte[ccgLength];
-                    Array.Copy(ccgBlock.Payload, 3, storedMessage.CcgData, 0, ccgLength);
+                    // Extract the actual CCG binary message (skip the 'B' and length prefix)
+                    var ccgData = new byte[ccgLength];
+                    Array.Copy(ccgBlock.Payload, 3, ccgData, 0, ccgLength);
                     
-                    // Parse message type and other info if possible
-                    if (ccgLength >= 4)
+                    // Store the CCG data (this will convert to Base64 automatically)
+                    storedMessage.CcgData = ccgData;
+                    
+                    // Parse CCG message type and instrument ID if available
+                    if (ccgData.Length >= 4)
                     {
-                        storedMessage.MessageType = BitConverter.ToUInt16(storedMessage.CcgData, 2);
-                        storedMessage.MessageName = GetMessageTypeName(storedMessage.MessageType);
+                        // CCG message format: uint16 length + uint16 msgType + ...
+                        storedMessage.MessageType = BitConverter.ToUInt16(ccgData, 2);
                         
-                        // Extract instrument ID if present
-                        if (ccgLength >= 21)
+                        // Try to extract instrument ID (depends on message type)
+                        if (ccgData.Length >= 20) // Most CCG messages have instrumentId at offset 16
                         {
-                            storedMessage.InstrumentId = BitConverter.ToUInt32(storedMessage.CcgData, 17);
+                            try
+                            {
+                                storedMessage.InstrumentId = BitConverter.ToUInt32(ccgData, 16);
+                            }
+                            catch
+                            {
+                                storedMessage.InstrumentId = 0;
+                            }
                         }
+                        
+                        // Set message name based on type
+                        storedMessage.MessageName = GetCcgMessageName(storedMessage.MessageType);
                     }
                 }
+                else
+                {
+                    throw new ArgumentException($"CCG block payload too short: expected {3 + ccgLength} bytes, got {ccgBlock.Payload.Length}");
+                }
+            }
+            else
+            {
+                throw new ArgumentException("CCG block payload too short to contain length header");
             }
 
             return storedMessage;
+        }
+        private static string GetCcgMessageName(ushort messageType)
+        {
+            return messageType switch
+            {
+                // Common CCG message types based on GPW specification
+                1 => "Login",
+                2 => "LoginResponse", 
+                3 => "Logout",
+                4 => "Heartbeat",
+                5 => "OrderAdd",
+                6 => "OrderAddResponse",
+                7 => "OrderModify",
+                8 => "OrderModifyResponse",
+                9 => "OrderCancel",
+                10 => "OrderCancelResponse",
+                11 => "Trade",
+                12 => "OrderMassCancel",
+                13 => "OrderMassCancelResponse",
+                14 => "TradeCaptureReportSingle",
+                15 => "TradeCaptureReportDual",
+                16 => "TradeCaptureReportResponse",
+                17 => "MarketDataSnapshot",
+                18 => "MarketDataIncrementalRefresh",
+                19 => "BidOfferUpdate",
+                20 => "ConnectionClose",
+                21 => "GapFill",
+                _ => $"Unknown({messageType})"
+            };
         }
 
         private static string GetMessageTypeName(ushort messageType)
