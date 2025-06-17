@@ -1,0 +1,16 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RC_Proxy", "RC_Proxy\RC_Proxy.csproj", "{7787498C-768D-4FDE-ADAE-46F8E4CF0972}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{7787498C-768D-4FDE-ADAE-46F8E4CF0972}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7787498C-768D-4FDE-ADAE-46F8E4CF0972}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7787498C-768D-4FDE-ADAE-46F8E4CF0972}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7787498C-768D-4FDE-ADAE-46F8E4CF0972}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
